@@ -37,6 +37,8 @@ Not yet: APU/audio, mappers 2/4 (UxROM/MMC3). ROMs requiring unsupported mappers
 
 ![Pac-Man](imgs/pacman.png)
 
+![Pac-Man-2](imgs/pacman_2.png)
+
 ![Tic-Tac-Toe](imgs/tictacxo.png)
 
 ## Dev
