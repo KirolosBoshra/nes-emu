@@ -1,4 +1,4 @@
-# emu-nes
+# NES-emu
 
 A NES emulator in C, grown out of a MOS 6502 CPU emulator
 ([emu-6502](https://github.com/KirolosBoshra/emu-6502)).

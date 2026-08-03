@@ -24,8 +24,9 @@ typedef struct {
   u8 oam[256];            // sprite RAM
   u8 vram[0x1000];        // 4 nametables (4 x 1KB); palette kept in pal[]
   u16 vaddr;              // $2006 fallback bus / current VRAM address
-  u16 t;                  // scroll+nametable register ($2005/$2006 combo)
+  u16 t;                  // temporary VRAM address latch ($2000/$2005/$2006)
   u8 fine_x;              // fine X scroll (0-7)
+  u8 scroll_x, scroll_y;  // display scroll captured only from $2005
   bool write_toggle;      // $2005/$2005 and $2006/$2007 latch
   u8 read_buffer;         // $2007 read latch (returned_T) for open bus
   bool in_vblank;         // true if in vblank
@@ -116,6 +117,13 @@ static u8 ppu_nt_index(const Cartridge *cart, u8 i) {
   return (i & 2) ? 2 : 0; // A A B B
 }
 
+// Pattern byte at flat CHR address `pa` ($0000-$1FFF), bank-wrapped.
+static u8 cart_chr_byte(const Cartridge *c, u32 pa) {
+  if (c->chr_banks == 0)
+    return 0;
+  return c->chr[pa / CHR_BANK][pa % CHR_BANK];
+}
+
 // Renders the current frame into pixels.
 static void ppu_render(PPU *ppu, const Cartridge *cart) {
   // Clear to the universal background color.
@@ -131,58 +139,83 @@ static void ppu_render(PPU *ppu, const Cartridge *cart) {
   bool show_bg = ppu->mask & plane_mask[0];
   bool show_sp = ppu->mask & plane_mask[1];
 
-  // Scroll origin in pixels (coarse*8 + fine).
-  int base_x = (ppu->t & 0x1F) * 8 + ppu->fine_x;
-  int base_y = ((ppu->t >> 5) & 0x1F) * 8 + ((ppu->t >> 12) & 7);
+  // Keep display scroll separate from the $2006 VRAM address latch.
+  // A nametable is 256x240 pixels, not 256x256.  Wrapping vertical
+  // coordinates at 256 incorrectly treats attribute bytes as two tile rows.
+  int base_x = ppu->scroll_x;
+  int base_y = ppu->scroll_y;
+  int base_nt_x = ppu->ctrl & 1;
+  int base_nt_y = (ppu->ctrl >> 1) & 1;
 
-  // Background: two-plane 8x8 tiles, wrapped across the 4 nametables.
+  // Background: two-plane 8x8 tiles, wrapped across logical nametables.
   if (show_bg) {
     for (int sy = 0; sy < 240; ++sy) {
-      int gy = base_y + sy; // wrap into coarse row
-      int tyrow = (gy >> 3) & 0x1F;
-      int nt_y = gy >> 8; // 0..1 vertical wrap
+      int world_y = base_y + sy;
+      int logical_nt_y = (base_nt_y + world_y / 240) & 1;
+      int local_y = world_y % 240;
+      int tyrow = local_y >> 3;       // always 0..29
+      int row = local_y & 7;
+
       for (int sx = 0; sx < 256; ++sx) {
-        int gx = base_x + sx;
-        int txcol = (gx >> 3) & 0x1F;
-        int nt_x = gx >> 8; // 0..1 horizontal wrap
-        u8 nt = ppu_nt_index(cart, nt_y * 2 + nt_x) * 0x400;
+        int world_x = base_x + sx;
+        int logical_nt_x = (base_nt_x + world_x / 256) & 1;
+        int local_x = world_x & 0xFF;
+        int txcol = local_x >> 3;
+        int col = local_x & 7;
+
+        u8 logical_nt = (u8)(logical_nt_y * 2 + logical_nt_x);
+        u16 nt = (u16)ppu_nt_index(cart, logical_nt) * 0x400;
         u32 tile = ppu->vram[nt + tyrow * 32 + txcol];
         u32 attr = ppu->vram[nt + 0x3C0 + (tyrow / 4) * 8 + (txcol / 4)];
         u32 palt = ((attr >> (((tyrow & 2) << 1) | (txcol & 2))) & 3) << 2;
-        const u8 *pat = cart->chr[(ppu->ctrl >> 4) & 1] + tile * 16;
-        u32 row = gy & 7, col = gx & 7;
-        u8 lo = pat[row], hi = pat[row + 8];
+        u32 pa = (((ppu->ctrl >> 4) & 1) << 12) | tile * 16;
+        u8 lo = cart_chr_byte(cart, pa + row);
+        u8 hi = cart_chr_byte(cart, pa + row + 8);
         u32 pix = ((lo >> (7 - col)) & 1) | (((hi >> (7 - col)) & 1) << 1);
-        u8 idx = ppu->pal[palt + pix]; // pix==0 -> backdrop (pal[0])
+        u8 idx = ppu->pal[pix ? palt + pix : 0];
         memcpy(ppu->pixels[sy][sx], ppu_palette[idx], 3);
       }
     }
   }
 
-  // Sprites: 8x8, over background, no flips yet.
+  // Sprites: 8x8 with OAM horizontal/vertical flip attributes.
   if (show_sp) {
     for (int k = 0; k < 64; ++k) {
       u8 oy = ppu->oam[k * 4 + 0];
       u8 tile = ppu->oam[k * 4 + 1];
       u8 at = ppu->oam[k * 4 + 2];
       u8 ox = ppu->oam[k * 4 + 3];
-      if (oy == 0 || oy >= 240)
+      if (oy >= 240)
         continue;
+
       u8 palt2 = 0x10 + ((at & 3) << 2);
-      const u8 *pat = cart->chr[(ppu->ctrl >> 4) & 1] + tile * 16;
-      for (int l = 0; l < 8; ++l)
-        for (int t = 0; t < 8; ++t) {
-          int px = ox + t - 1; // sprite fetch starts one pixel earlier
-          int py = oy + l - 1;
+      u32 pa = (((ppu->ctrl >> 3) & 1) << 12) | ((u32)tile * 16);
+      bool flip_h = (at & 0x40) != 0;
+      bool flip_v = (at & 0x80) != 0;
+
+      for (int y = 0; y < 8; ++y) {
+        int source_y = flip_v ? (7 - y) : y;
+        u8 lo = cart_chr_byte(cart, pa + source_y);
+        u8 hi = cart_chr_byte(cart, pa + source_y + 8);
+
+        for (int x = 0; x < 8; ++x) {
+          // In an NES pattern byte, bit 7 is the leftmost pixel. Horizontal
+          // flip makes output x=0 read source x=7, i.e. bit 0.
+          int bit = flip_h ? x : (7 - x);
+          u8 pix = ((lo >> bit) & 1) | (((hi >> bit) & 1) << 1);
+          if (!pix)
+            continue;
+
+          // OAM X is exact. OAM Y stores the sprite's top coordinate minus 1.
+          int px = (int)ox + x;
+          int py = (int)oy + 1 + y;
           if (py < 0 || py >= 240 || px < 0 || px >= 256)
             continue;
-          u8 lo = pat[l], hi = pat[l + 8];
-          u8 pix = ((lo >> (7 - t)) & 1) | (((hi >> (7 - t)) & 1) << 1);
-          if (pix) {
-            u8 ci = ppu->pal[palt2 + pix];
-            memcpy(ppu->pixels[py][px], ppu_palette[ci], 3);
-          }
+
+          u8 ci = ppu->pal[palt2 + pix];
+          memcpy(ppu->pixels[py][px], ppu_palette[ci], 3);
         }
+      }
     }
   }
 }
@@ -229,12 +262,12 @@ static u8 ppu_read_reg(PPU *ppu, u8 reg) {
       u8 i = ppu_pal_index((u8)a);
       u8 out = ppu->pal[i];
       ppu->read_buffer = ppu->vram[a & 0xFFF]; // open-bus poke
-      ppu->vaddr = (ppu->vaddr + 1) & 0x7FFF;
+      ppu->vaddr = (ppu->vaddr + ((ppu->ctrl & 0x04) ? 32 : 1)) & 0x7FFF;
       return out;
     } else {
       u8 out = ppu->read_buffer;
       ppu->read_buffer = ppu->vram[a & 0xFFF];
-      ppu->vaddr = (ppu->vaddr + 1) & 0x7FFF;
+      ppu->vaddr = (ppu->vaddr + ((ppu->ctrl & 0x04) ? 32 : 1)) & 0x7FFF;
       return out;
     }
   }
@@ -247,6 +280,8 @@ static void ppu_write_reg(PPU *ppu, u8 reg, u8 value) {
   switch (reg & 7) {
   case 0:
     ppu->ctrl = value;
+    // PPUCTRL nametable bits are copied into temporary VRAM address t.
+    ppu->t = (ppu->t & 0xF3FF) | ((u16)(value & 3) << 10);
     break;
   case 1:
     ppu->mask = value & 0x1F;
@@ -258,20 +293,26 @@ static void ppu_write_reg(PPU *ppu, u8 reg, u8 value) {
     ppu->oam[ppu->oam_addr] = value;
     ppu->oam_addr = (ppu->oam_addr + 1) & 0xFF;
     break;
-  case 5: { // scroll (two writes)
-    if (!ppu->write_toggle)
-      ppu->t = (ppu->t & 0xFFE0) | (value >> 3), ppu->fine_x = value & 7;
-    else
-      ppu->t = (ppu->t & 0xBFFF) | ((value & 7) << 12) | ((value & 0xF8) << 2);
+  case 5: { // PPUSCROLL (two writes: X, then Y)
+    if (!ppu->write_toggle) {
+      ppu->scroll_x = value;
+      ppu->t = (ppu->t & 0xFFE0) | (value >> 3);
+      ppu->fine_x = value & 7;
+    } else {
+      ppu->scroll_y = value;
+      ppu->t = (ppu->t & 0x8C1F) | ((u16)(value & 7) << 12) |
+               ((u16)(value & 0xF8) << 2);
+    }
     ppu->write_toggle ^= 1;
     break;
   }
-  case 6: { // vram address (two writes)
-    if (!ppu->write_toggle)
-      ppu->t = (ppu->t & 0x00FF) | ((value & 0x3F) << 8);
-    else
+  case 6: { // PPUADDR (two writes: high, then low)
+    if (!ppu->write_toggle) {
+      ppu->t = (ppu->t & 0x00FF) | ((u16)(value & 0x3F) << 8);
+    } else {
       ppu->t = (ppu->t & 0xFF00) | value;
-    ppu->vaddr = ppu->t;
+      ppu->vaddr = ppu->t;
+    }
     ppu->write_toggle ^= 1;
     break;
   }
@@ -280,7 +321,7 @@ static void ppu_write_reg(PPU *ppu, u8 reg, u8 value) {
       ppu->pal[ppu_pal_index((u8)ppu->vaddr)] = value;
     else
       ppu->vram[ppu->vaddr & 0x0FFF] = value;
-    ppu->vaddr = (ppu->vaddr + 1) & 0x7FFF;
+    ppu->vaddr = (ppu->vaddr + ((ppu->ctrl & 0x04) ? 32 : 1)) & 0x7FFF;
     break;
   }
   }

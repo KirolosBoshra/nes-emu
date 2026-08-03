@@ -1,4 +1,5 @@
 build/
+.cache/
 *.lst
 *.exe
 *.ppm
