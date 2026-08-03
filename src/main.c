@@ -28,6 +28,24 @@ static void run_window(Bus *bus, CPU *cpu) {
   img.format = PIXELFORMAT_UNCOMPRESSED_R8G8B8A8;
   Texture2D tex = LoadTextureFromImage(img);
   while (!WindowShouldClose()) {
+    u8 pad0 = 0;
+    if (IsKeyDown(KEY_X))
+      pad0 |= 0x01; // A
+    if (IsKeyDown(KEY_Z))
+      pad0 |= 0x02; // B
+    if (IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT))
+      pad0 |= 0x04; // Select
+    if (IsKeyDown(KEY_ENTER))
+      pad0 |= 0x08; // Start
+    if (IsKeyDown(KEY_UP))
+      pad0 |= 0x10;
+    if (IsKeyDown(KEY_DOWN))
+      pad0 |= 0x20;
+    if (IsKeyDown(KEY_LEFT))
+      pad0 |= 0x40;
+    if (IsKeyDown(KEY_RIGHT))
+      pad0 |= 0x80;
+    bus->joypad.pad[0] = pad0;
     run_frame(bus, cpu);
     for (i32 i = 0; i < 256 * 240; ++i) {
       buf[i * 4 + 0] = bus->ppu.pixels[i / 256][i % 256][0];
@@ -57,20 +75,28 @@ static bool dump_ppm(Bus *bus, const char *filename) {
 }
 
 i32 main(int argc, char **argv) {
-  const char *rom_file = argv[1];
+  const char *rom_file = NULL;
   const char *dump_file = NULL;
   u32 frames = 0;
 
-  for (i32 i = 2; i < argc; ++i) {
-    if (strcmp(argv[i], "--dump") == 0 && i + 1 < argc)
+  for (i32 i = 1; i < argc; ++i) {
+    if (strcmp(argv[i], "-g") == 0 && i + 1 < argc)
+      rom_file = argv[++i];
+    else if (strcmp(argv[i], "-f") == 0 && i + 1 < argc)
+      frames = (u32)strtoul(argv[++i], NULL, 10);
+    else if (strcmp(argv[i], "--dump") == 0 && i + 1 < argc)
       dump_file = argv[++i];
-    else if (argv[i][0] != '-')
-      frames = (u32)strtoul(argv[i], NULL, 10);
     else {
-      fprintf(stderr, "Usage: %s <game.nes> [frames] [--dump out.ppm]\n",
+      fprintf(stderr, "Usage: %s -g <game.nes> [-f frames] [--dump out.ppm]\n",
               argv[0]);
       return 1;
     }
+  }
+
+  if (!rom_file) {
+    fprintf(stderr, "Usage: %s -g <game.nes> [-f frames] [--dump out.ppm]\n",
+            argv[0]);
+    return 1;
   }
 
   static Bus bus;
@@ -98,63 +124,41 @@ i32 main(int argc, char **argv) {
     }
   }
 
+  // Self-check: $4016/$4017 shift independently; a game interleaving 8
+  {
+    Bus t;
+    init_bus(&t);
+    t.joypad.pad[0] = 0x5A;
+    t.joypad.pad[1] = 0x33;
+    bus_write(&t, 0x4016, 1);
+    bus_write(&t, 0x4016, 0);
+    u8 p1 = 0, p2 = 0;
+    for (i32 i = 0; i < 8; ++i) {
+      p1 = (u8)((p1 >> 1) | ((bus_read(&t, 0x4016) & 1) << 7));
+      p2 = (u8)((p2 >> 1) | ((bus_read(&t, 0x4017) & 1) << 7));
+    }
+    if (p1 != 0x5A || p2 != 0x33) {
+      fprintf(stderr, "joypad self-check FAIL p1=%02X p2=%02X\n", p1, p2);
+      return 1;
+    }
+  }
+
   CPU cpu;
   cpu_reset(&cpu, &bus);
-
-  printf("PRG banks: %u  CHR banks: %u\n", (unsigned)bus.cart.prg_banks,
-         (unsigned)bus.cart.chr_banks);
-  printf("Reset vector: 0x%04X\n", (unsigned)cpu.PC);
 
   if (frames == 0) {
     run_window(&bus, &cpu);
     return 0;
   }
 
-  for (u32 i = 0; i < frames; ++i) {
+  for (u32 i = 0; i < frames; ++i)
     run_frame(&bus, &cpu);
-    printf("frame %u  PC=0x%04X  cycles=%llu\n", i, (unsigned)cpu.PC,
-           (unsigned long long)cpu.cycles);
-    if (i % 25 == 0) {
-      i32 nz = 0;
-      for (i32 k = 0; k < 256; k++)
-        if (bus.ppu.oam[k])
-          nz++;
-      printf("  oam-nz=%d\n", nz);
-    }
-  }
-  printf("ppu dots=%llu status=0x%02X\n", (unsigned long long)bus.ppu.dots,
-         (unsigned)bus.ppu.status);
 
   if (dump_file) {
-    fprintf(stderr, "t=%04X vaddr=%04X ctrl=%02X mask=%02X pal0=%02X\n",
-            (unsigned)bus.ppu.t, (unsigned)bus.ppu.vaddr,
-            (unsigned)bus.ppu.ctrl, (unsigned)bus.ppu.mask,
-            (unsigned)bus.ppu.pal[0]);
-    i32 n = 0;
-    for (i32 i = 0; i < 0x400; i++)
-      if (bus.ppu.vram[i])
-        n++;
-    for (i32 k = 0; k < 64; k++) {
-      u8 oy = bus.ppu.oam[k * 4 + 0];
-      if (oy && oy < 240)
-        fprintf(stderr, "spr %02d y=%03d x=%03d tile=%02X at=%02X\n", k, oy,
-                (unsigned)bus.ppu.oam[k * 4 + 3],
-                (unsigned)bus.ppu.oam[k * 4 + 1],
-                (unsigned)bus.ppu.oam[k * 4 + 2]);
-    }
-    for (i32 k = 0; k < 64; k++) {
-      u8 oy = bus.ppu.oam[k * 4 + 0];
-      if (oy && oy < 240)
-        fprintf(stderr, "spr %02d y=%03d x=%03d tile=%02X at=%02X\n", k, oy,
-                (unsigned)bus.ppu.oam[k * 4 + 3],
-                (unsigned)bus.ppu.oam[k * 4 + 1],
-                (unsigned)bus.ppu.oam[k * 4 + 2]);
-    }
     if (!dump_ppm(&bus, dump_file)) {
       fprintf(stderr, "Failed to write frame dump\n");
       return 1;
     }
-    printf("wrote %s\n", dump_file);
   }
 
   return 0;

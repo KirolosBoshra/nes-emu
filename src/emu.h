@@ -30,10 +30,18 @@ typedef enum {
 } CPUFlag;
 
 typedef struct {
+  u8 pad[2];        // button snapshot (bit0=A,1=B,2=Select,3=Start,4=Up,5=Down,6=Left,7=Right)
+  u8 pad_shift[2];  // shift register snapshot
+  u8 pad_index[2];  // read position per pad ($4016/$4017 are separate registers)
+  bool pad_strobe;
+} Joypad;
+
+typedef struct {
   u8 ram[0x800]; // 2KB internal RAM
 
   Cartridge cart;
   PPU ppu;
+  Joypad joypad;
 
   bool nmi_pending;
   bool irq_pending;
@@ -78,7 +86,19 @@ static u8 bus_read(void *self, u16 addr) {
     return bus->ram[addr & 0x7FF];
   if (addr < 0x4000)
     return ppu_read_reg(&bus->ppu, addr & 7);
-  // $4000+ -> APU/controller registers (stubs) or PRG ROM
+  if (addr == 0x4016 || addr == 0x4017) {
+    // Controller read: strobe high -> A held, else shift out one bit.
+    // ponytail: index wraps at 8 instead of emitting open-bus 1s; games
+    // only read 8 bits. $4016/$4017 shift independently (games interleave
+    // the reads), so each pad keeps its own index.
+    u8 p = addr & 1;
+    if (bus->joypad.pad_strobe)
+      return bus->joypad.pad[p] & 1;
+    u8 bit = (bus->joypad.pad_shift[p] >> bus->joypad.pad_index[p]) & 1;
+    bus->joypad.pad_index[p] = (bus->joypad.pad_index[p] + 1) & 7;
+    return bit;
+  }
+  // $4000+ -> APU registers (stubs) or PRG ROM
   return cart_read_prg(&bus->cart, addr);
 }
 
@@ -96,6 +116,15 @@ static void bus_write(void *self, u16 addr, u8 value) {
   }
   if (addr == 0x4014)
     ppu_oam_dma(&bus->ppu, bus, value);
+  else if (addr == 0x4016) { // strobe: latch buttons on 1->0 edge
+    bus->joypad.pad_strobe = value & 1;
+    if (!(value & 1)) {
+      bus->joypad.pad_shift[0] = bus->joypad.pad[0];
+      bus->joypad.pad_shift[1] = bus->joypad.pad[1];
+      bus->joypad.pad_index[0] = 0;
+      bus->joypad.pad_index[1] = 0;
+    }
+  }
   // Other $4000+ and PRG ROM writes ignored (stubs)
 }
 
